@@ -4,13 +4,15 @@ Auto-Simas training loop.
 Minimizes L(p) = sum_i E(x_i, f(p(x_i) ⊕ x_i)) via REINFORCE.
 
   p(x; θ)  -- T5-small prefix model (trained)
-  f(·)     -- frozen Claude (inference-only)
+  f(·)     -- frozen Claude via Bedrock (inference-only)
   E(·, ·)  -- exact-match evaluator on GSM8K final numeric answer
 """
 
 import argparse
+import concurrent.futures
 import os
 import random
+import time
 
 import torch
 from tqdm import tqdm
@@ -20,31 +22,23 @@ from frozen_llm import FrozenLLM
 from prefix_model import PrefixModel
 
 
-def evaluate(prefix_model, llm, examples, temperature: float = 0.0) -> float:
-    """Return mean accuracy on examples. Uses greedy decoding (temperature=0) for eval."""
+def call_llm(llm: FrozenLLM, prompt: str) -> str:
+    try:
+        return llm(prompt)
+    except Exception:
+        return ""
+
+
+def evaluate(prefix_model: PrefixModel, llm: FrozenLLM, examples: list) -> float:
+    """Return mean accuracy on examples using greedy prefix decoding."""
     correct = 0
     for ex in tqdm(examples, desc="eval", leave=False):
-        question = ex["question"]
         gold = extract_gold_answer(ex["answer"])
         if gold is None:
             continue
-
-        prefix_model.model.eval()
-        with torch.no_grad():
-            enc = prefix_model._encode_question(question)
-            out_ids = prefix_model.model.generate(
-                input_ids=enc.input_ids,
-                attention_mask=enc.attention_mask,
-                max_new_tokens=prefix_model.max_prefix_tokens,
-                do_sample=False,  # greedy
-            )
-        prefix_text = prefix_model.tokenizer.decode(out_ids[0, 1:], skip_special_tokens=True)
-
-        prompt = f"{prefix_text}\n\n{question}" if prefix_text else question
-        llm_output = llm(prompt)
-        predicted = extract_predicted_answer(llm_output)
-        correct += score(gold, predicted)
-
+        prefix_text, _ = prefix_model.generate(ex["question"])
+        prompt = f"{prefix_text}\n\n{ex['question']}" if prefix_text else ex["question"]
+        correct += score(gold, extract_predicted_answer(llm(prompt)))
     return correct / len(examples) if examples else 0.0
 
 
@@ -54,18 +48,20 @@ def train(args):
     test_data = list(load_gsm8k("test"))
     eval_examples = random.sample(test_data, min(args.eval_size, len(test_data)))
 
-    print("Initialising prefix model (T5-small) …")
+    print(f"Initialising prefix model ({args.prefix_model}) …")
     prefix_model = PrefixModel(
         model_name=args.prefix_model,
         max_prefix_tokens=args.max_prefix_tokens,
+        device=args.device,
     )
+    print(f"  device: {prefix_model.device}")
 
     print(f"Initialising frozen LLM ({args.llm_model}) …")
     llm = FrozenLLM(model=args.llm_model)
 
     # ------------------------------------------------------------------ warm-start
     if args.warmup_steps > 0:
-        print(f"Warm-starting for {args.warmup_steps} steps with: "{args.warmup_prefix}"")
+        print(f"Warm-starting for {args.warmup_steps} steps with: '{args.warmup_prefix}'")
         warmup_qs = [ex["question"] for ex in random.sample(train_data, 64)]
         prefix_model.warm_start(
             fixed_prefix=args.warmup_prefix,
@@ -76,56 +72,63 @@ def train(args):
 
     # ------------------------------------------------------------------ REINFORCE
     optimizer = torch.optim.Adam(prefix_model.parameters(), lr=args.lr)
-    baseline = 0.0  # exponential moving average of recent mean rewards
+    baseline = 0.0  # EMA of recent mean rewards
 
     os.makedirs(args.save_dir, exist_ok=True)
     best_acc = 0.0
 
     for step in range(args.num_steps):
-        batch = random.sample(train_data, args.batch_size)
+        t0 = time.perf_counter()
+        raw_batch = random.sample(train_data, args.batch_size)
 
-        log_probs: list[torch.Tensor] = []
-        rewards: list[float] = []
-        prefixes: list[str] = []
-
-        for ex in batch:
-            question = ex["question"]
+        questions = []
+        golds = []
+        for ex in raw_batch:
             gold = extract_gold_answer(ex["answer"])
-            if gold is None:
-                continue
+            if gold is not None:
+                questions.append(ex["question"])
+                golds.append(gold)
 
-            prefix_text, log_prob = prefix_model.generate(question, temperature=args.temperature)
-            prompt = f"{prefix_text}\n\n{question}" if prefix_text else question
-            llm_output = llm(prompt)
-            predicted = extract_predicted_answer(llm_output)
-            r = score(gold, predicted)
-
-            log_probs.append(log_prob)
-            rewards.append(r)
-            prefixes.append(prefix_text)
-
-        if not log_probs:
+        if not questions:
             continue
 
+        prefix_texts, log_probs = prefix_model.generate_batch(
+            questions, temperature=args.temperature
+        )
+
+        prompts = [
+            f"{p}\n\n{q}" if p else q
+            for p, q in zip(prefix_texts, questions)
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+            llm_outputs = list(pool.map(lambda pr: call_llm(llm, pr), prompts))
+
+        rewards = [
+            score(gold, extract_predicted_answer(out))
+            for gold, out in zip(golds, llm_outputs)
+        ]
+
         mean_reward = sum(rewards) / len(rewards)
-        # EMA baseline to reduce variance without introducing bias asymptotically.
         baseline = 0.9 * baseline + 0.1 * mean_reward
 
-        # REINFORCE loss: -E[(r - b) * log π_θ(p | x)]
-        loss = torch.stack([
-            -(r - baseline) * lp
-            for r, lp in zip(rewards, log_probs)
-        ]).mean()
+        advantages = torch.tensor(
+            [r - baseline for r in rewards],
+            dtype=torch.float32,
+            device=prefix_model.device,
+        )
+        loss = -(advantages * log_probs).mean()
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(prefix_model.parameters(), max_norm=1.0)
         optimizer.step()
 
+        elapsed = time.perf_counter() - t0
         print(
             f"step {step:4d}  reward={mean_reward:.3f}  "
             f"baseline={baseline:.3f}  loss={loss.item():.4f}  "
-            f"prefix="{prefixes[0][:60]}""
+            f"step_time={elapsed:.1f}s  "
+            f"prefix='{prefix_texts[0][:60]}'"
         )
 
         # -------------------------------------------------------------- eval
@@ -158,7 +161,9 @@ def main():
     p.add_argument("--eval-size", type=int, default=50)
     p.add_argument("--save-dir", type=str, default="checkpoints")
     p.add_argument("--prefix-model", type=str, default="t5-small")
-    p.add_argument("--llm-model", type=str, default="anthropic.claude-haiku-4-5-20251001-v1:0")
+    p.add_argument("--llm-model", type=str, default="us.anthropic.claude-haiku-4-5-20251001-v1:0")
+    p.add_argument("--device", type=str, default=None,
+                   help="Device for the prefix model (cpu, mps, cuda). Defaults to auto-detect.")
     p.add_argument("--seed", type=int, default=42)
 
     args = p.parse_args()
