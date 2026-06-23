@@ -11,3 +11,15 @@ ${x_i}_{i=1}^n$ of benchmark inputs.
 Simas's job is to find a prompt prefix $p$ that minimizes $\mathcal{L}(p) \equiv \sum_i E(x_i, f(p(x_i) \oplus x_i))$.
 
 Simas tunes $p$ by hand. Auto-Simas represents $p(x;\theta)$ with a very small Transformer model.
+
+## Setup
+
+```bash
+uv pip install -r requirements.txt
+```
+
+## Run
+
+```bash
+python train.py --num-steps 100 --batch-size 8 --warmup-steps 20 --eval-every 10 --eval-size 50
+```
