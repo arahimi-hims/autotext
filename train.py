@@ -61,11 +61,14 @@ def train(args):
 
     # ------------------------------------------------------------------ warm-start
     if args.warmup_steps > 0:
-        print(f"Warm-starting for {args.warmup_steps} steps with: '{args.warmup_prefix}'")
-        warmup_qs = [ex["question"] for ex in random.sample(train_data, 64)]
+        print(f"Warm-starting for {args.warmup_steps} steps on gold answers …")
+        warmup_pool = [ex for ex in random.sample(train_data, 256)
+                       if extract_gold_answer(ex["answer"]) is not None]
+        warmup_qs = [ex["question"] for ex in warmup_pool]
+        warmup_targets = [str(extract_gold_answer(ex["answer"])) for ex in warmup_pool]
         prefix_model.warm_start(
-            fixed_prefix=args.warmup_prefix,
             questions=warmup_qs,
+            targets=warmup_targets,
             num_steps=args.warmup_steps,
             lr=args.warmup_lr,
         )
@@ -154,8 +157,6 @@ def main():
     p.add_argument("--max-prefix-tokens", type=int, default=32)
     p.add_argument("--warmup-steps", type=int, default=20,
                    help="Number of supervised warm-start steps before REINFORCE.")
-    p.add_argument("--warmup-prefix", type=str, default="Let's think step by step.",
-                   help="Fixed prefix to imitate during warm-start.")
     p.add_argument("--warmup-lr", type=float, default=1e-3)
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--eval-size", type=int, default=50)
