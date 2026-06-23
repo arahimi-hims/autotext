@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from transformers import T5ForConditionalGeneration, AutoTokenizer
 
 
@@ -24,22 +25,24 @@ class PrefixModel:
     def parameters(self):
         return self.model.parameters()
 
-    def _encode_question(self, question: str):
+    def _encode(self, questions: list[str]):
         return self.tokenizer(
-            self.ENCODER_PREFIX + question,
+            [self.ENCODER_PREFIX + q for q in questions],
             return_tensors="pt",
             max_length=512,
             truncation=True,
+            padding=True,
         ).to(self.device)
 
-    def generate(self, question: str, temperature: float = 1.0) -> tuple[str, torch.Tensor]:
+    def generate_batch(
+        self, questions: list[str], temperature: float = 1.0
+    ) -> tuple[list[str], torch.Tensor]:
+        """Sample p_i ~ π_θ(· | question_i) for each question and return
+        (prefix_texts, log_probs) where log_probs has shape (batch,) with
+        gradients w.r.t. model parameters.
         """
-        Sample p ~ π_θ(· | question) and return (prefix_text, log_prob).
-        log_prob is a scalar tensor with gradient w.r.t. model parameters.
-        """
-        enc = self._encode_question(question)
+        enc = self._encode(questions)
 
-        # Sampling pass: no grad needed, just get the discrete token sequence.
         self.model.eval()
         with torch.no_grad():
             out_ids = self.model.generate(
@@ -50,12 +53,10 @@ class PrefixModel:
                 temperature=temperature,
             )
 
-        # T5 generate() prepends decoder_start_token_id (= pad_token_id = 0) at position 0.
-        # The actual generated tokens start at position 1.
+        # T5 prepends decoder_start_token_id (= pad_token_id = 0) at position 0.
         generated_ids = out_ids[:, 1:]
-        prefix_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        prefix_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-        # Forward pass: compute log π_θ(generated_ids | question) WITH gradients.
         self.model.train()
         labels = generated_ids.clone()
         labels[labels == self.tokenizer.pad_token_id] = -100
@@ -66,11 +67,24 @@ class PrefixModel:
             labels=labels,
         )
 
-        # out.loss is the mean NLL per non-masked token; multiply by count to get the sum.
-        n_tokens = (labels != -100).sum()
-        log_prob = -out.loss * n_tokens
+        # out.loss is the batch mean — we need per-example sums for REINFORCE.
+        # Recompute from logits using gather.
+        safe_labels = labels.clone()
+        safe_labels[safe_labels == -100] = 0
+        token_log_probs = (
+            F.log_softmax(out.logits, dim=-1)
+            .gather(2, safe_labels.unsqueeze(-1))
+            .squeeze(-1)
+        )
+        mask = (labels != -100).float()
+        log_probs = (token_log_probs * mask).sum(dim=1)
 
-        return prefix_text, log_prob
+        return prefix_texts, log_probs
+
+    def generate(self, question: str, temperature: float = 1.0) -> tuple[str, torch.Tensor]:
+        """Single-example wrapper around generate_batch, used by eval scripts."""
+        texts, log_probs = self.generate_batch([question], temperature)
+        return texts[0], log_probs[0]
 
     def warm_start(
         self,
@@ -97,7 +111,7 @@ class PrefixModel:
         for step in range(num_steps):
             total_loss = 0.0
             for q in questions[:8]:
-                enc = self._encode_question(q)
+                enc = self._encode([q])
                 out = self.model(
                     input_ids=enc.input_ids,
                     attention_mask=enc.attention_mask,

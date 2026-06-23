@@ -8,7 +8,6 @@ Usage:
 import argparse
 import random
 
-import torch
 from tqdm import tqdm
 
 from dataset import load_gsm8k, extract_gold_answer, extract_predicted_answer, score
@@ -22,7 +21,7 @@ def main():
     p.add_argument("--split", default="test", choices=["train", "test"])
     p.add_argument("--n", type=int, default=None,
                    help="Number of examples to evaluate. Defaults to the full split.")
-    p.add_argument("--llm-model", default="anthropic.claude-haiku-4-5-20251001-v1:0")
+    p.add_argument("--llm-model", default="us.anthropic.claude-haiku-4-5-20251001-v1:0")
     p.add_argument("--max-prefix-tokens", type=int, default=32)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
@@ -44,16 +43,7 @@ def main():
         if gold is None:
             continue
 
-        with torch.no_grad():
-            enc = prefix_model._encode_question(ex["question"])
-            out_ids = prefix_model.model.generate(
-                input_ids=enc.input_ids,
-                attention_mask=enc.attention_mask,
-                max_new_tokens=prefix_model.max_prefix_tokens,
-                do_sample=False,
-            )
-        prefix_text = prefix_model.tokenizer.decode(out_ids[0, 1:], skip_special_tokens=True)
-
+        prefix_text, _ = prefix_model.generate(ex["question"], temperature=1.0)
         prompt = f"{prefix_text}\n\n{ex['question']}" if prefix_text else ex["question"]
         output = llm(prompt)
         correct += score(gold, extract_predicted_answer(output))
