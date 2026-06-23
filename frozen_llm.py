@@ -1,18 +1,25 @@
-import anthropic
+import boto3
 
 
 class FrozenLLM:
-    """Thin wrapper around the Anthropic API that treats Claude as the frozen f(·)."""
+    """Bedrock wrapper that treats Claude as the frozen f(·)."""
 
-    def __init__(self, model: str = "claude-haiku-4-5-20251001", max_tokens: int = 512):
-        self.client = anthropic.Anthropic()
+    def __init__(
+        self,
+        model: str = "anthropic.claude-haiku-4-5-20251001-v1:0",
+        region: str = "us-east-1",
+        profile: str = "ai-privileged",
+        max_tokens: int = 512,
+    ):
+        session = boto3.Session(profile_name=profile, region_name=region)
+        self.client = session.client("bedrock-runtime")
         self.model = model
         self.max_tokens = max_tokens
 
     def __call__(self, prompt: str) -> str:
-        msg = self.client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            messages=[{"role": "user", "content": prompt}],
+        response = self.client.converse(
+            modelId=self.model,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": self.max_tokens},
         )
-        return msg.content[0].text
+        return response["output"]["message"]["content"][0]["text"]

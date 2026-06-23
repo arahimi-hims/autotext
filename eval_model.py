@@ -22,7 +22,7 @@ def main():
     p.add_argument("--split", default="test", choices=["train", "test"])
     p.add_argument("--n", type=int, default=None,
                    help="Number of examples to evaluate. Defaults to the full split.")
-    p.add_argument("--llm-model", default="claude-haiku-4-5-20251001")
+    p.add_argument("--llm-model", default="anthropic.claude-haiku-4-5-20251001-v1:0")
     p.add_argument("--max-prefix-tokens", type=int, default=32)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
