@@ -16,7 +16,7 @@ class PrefixModel:
         max_prefix_tokens: int = 32,
         device: str | None = None,
     ):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = T5ForConditionalGeneration.from_pretrained(model_name).to(self.device)
         self.max_prefix_tokens = max_prefix_tokens
