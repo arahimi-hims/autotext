@@ -1,5 +1,0 @@
-torch>=2.0
-transformers>=4.35
-datasets>=2.14
-anthropic>=0.25
-tqdm>=4.66
