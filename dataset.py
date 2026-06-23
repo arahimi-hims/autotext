@@ -3,7 +3,7 @@ from datasets import load_dataset
 
 
 def load_gsm8k(split: str = "train"):
-    return load_dataset("gsm8k", "main")[split]
+    return load_dataset("openai/gsm8k", "main")[split]
 
 
 def extract_gold_answer(answer_str: str) -> float | None:

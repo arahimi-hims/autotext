@@ -158,7 +158,7 @@ def main():
     p.add_argument("--eval-size", type=int, default=50)
     p.add_argument("--save-dir", type=str, default="checkpoints")
     p.add_argument("--prefix-model", type=str, default="t5-small")
-    p.add_argument("--llm-model", type=str, default="claude-haiku-4-5-20251001")
+    p.add_argument("--llm-model", type=str, default="anthropic.claude-haiku-4-5-20251001-v1:0")
     p.add_argument("--seed", type=int, default=42)
 
     args = p.parse_args()
