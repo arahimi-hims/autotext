@@ -15,7 +15,7 @@ Simas tunes $p$ by hand. Auto-Simas represents $p(x;\theta)$ with a very small T
 ## Setup
 
 ```bash
-uv pip install -r requirements.txt
+uv sync
 ```
 
 ## Run
