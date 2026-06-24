@@ -1,58 +1,23 @@
-# Auto-Simas
+# Auto-Simas — Hidden-Prefix Recovery
 
-A frozen large LLM `f: text → text` takes a context and produces text. An
-evaluator `E: text × text → ℝ` scores the LLM's output against a reference.
-Given a dataset of benchmark inputs `{x_i}`, we build a prefix function
-`p(x; θ)` — represented by a small T5 model — and feed the LLM the concatenated
-context `p(x; θ) ⊕ x`. Simas tunes `p` by hand; Auto-Simas learns `θ` via
-REINFORCE.
+A frozen large LLM `f: text → text` takes a context and produces text. We
+have a hidden prefix `p*` and a pool of 50 unlabelled instructions
+`x_1 … x_N`. The frozen LLM produces gold outputs `y_i* = f(p* ⊕ x_i)`,
+pre-computed once at startup. A T5-small prefix model `p(·; θ)` sees only the
+instructions and must infer a prefix that reproduces those gold outputs.
 
 ## Notation
 
 | Symbol | Meaning |
 |--------|---------|
 | `f` | Frozen large LLM (Claude via Bedrock) |
+| `p*` | Hidden prefix drawn from the prefix pool |
+| `x_1 … x_N` | Instruction pool (fixed, diverse, prefix-sensitive) |
+| `y_i*` | Gold output `f(p* ⊕ x_i)`, pre-computed once at startup |
 | `p(·; θ)` | T5-small prefix model (trained) |
-| `E(y, y*)` | Evaluator that scores predicted output `y` against reference `y*` |
-| `p*` | Hidden prefix (Experiment 2 only) drawn from the prefix pool |
-| `y_i*` | Gold output (Experiment 2 only): `f(p* ⊕ x_i)`, pre-computed once |
+| `E(y, y*)` | Judge: T5 encoder cosine similarity, scaled to [0, 100] |
 
-## Setup
-
-```bash
-uv sync
-```
-
----
-
-## Experiment 1 — GSM8K prefix optimisation
-
-Find `θ` that minimises
-
-```
-L(θ) = sum_i E(x_i, f(p(x_i; θ) ⊕ x_i))
-```
-
-where `{x_i}` are GSM8K math word problems and `E` is exact match on the final
-numeric answer. This is the original Auto-Simas objective.
-
-```bash
-python train.py \
-  --num-steps 100 \
-  --batch-size 8 \
-  --warmup-steps 20 \
-  --eval-every 10 \
-  --eval-size 50
-```
-
----
-
-## Experiment 2 — Hidden-prefix recovery
-
-Instead of a labelled dataset, we have a hidden prefix `p*` and a pool of 50
-unlabelled instructions `x_1 … x_N`. The frozen LLM produces gold outputs
-`y_i* = f(p* ⊕ x_i)`, pre-computed once at startup. The T5 prefix model sees
-only the instructions and must infer a prefix that reproduces those gold outputs.
+## Objective
 
 Find `θ` that minimises
 
@@ -60,20 +25,31 @@ Find `θ` that minimises
 L(θ) = -sum_i  E( f(p(x_i; θ) ⊕ x_i),  y_i* )
 ```
 
-where `E` is cosine similarity between T5 encoder embeddings, scaled to [0, 100].
+Because the judge is non-differentiable, we optimise with REINFORCE. The reward
+for a batch step is the mean judge score over the sampled instructions.
+
+## Setup
 
 ```bash
-python train2.py \
+uv sync
+```
+
+## Run
+
+```bash
+python train.py \
   --prefix-id 0 \
   --num-steps 200 \
   --batch-size 8 \
-  --warmup-steps 20 \
+  --warmup-steps 3 \
   --eval-every 20 \
   --eval-size 20
 ```
 
 `--prefix-id` selects the hidden prefix from [prefix_pool.py](prefix_pool.py)
 (0–19). To sweep over all prefixes, run the script once per index.
+
+## Design choices
 
 ### Instructions x_1 … x_N
 
@@ -123,12 +99,8 @@ Gold outputs for a chosen `p*` are cached to `gold_cache/gold_prefix{id}.json`
 on first run and reloaded on subsequent runs, so training steps never fire extra
 LLM calls for the gold side.
 
-### Comparison
+### Warm-start
 
-| | Experiment 1 | Experiment 2 |
-|--|--|--|
-| Dataset | GSM8K (labelled Q&A) | Fixed instruction pool (unlabelled) |
-| Gold signal | Exact numeric match | T5 encoder cosine similarity |
-| Judge calls per step | 0 (local regex) | 0 (local T5 encoder) |
-| LLM calls per step | `batch_size` | `batch_size` (gold pre-computed once) |
-| Training target | High accuracy on benchmark | Reproduce outputs of a hidden prefix |
+The warm-start trains T5 for a few steps to output `"you are a ..."` for every
+instruction. This gives REINFORCE a starting point in the right region of output
+space (short persona-style prefix) without handing it the answer.

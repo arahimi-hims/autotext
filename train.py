@@ -1,15 +1,18 @@
 """
-Auto-Simas training loop.
+Hidden-prefix recovery training loop.
 
-Minimizes L(p) = sum_i E(x_i, f(p(x_i) ⊕ x_i)) via REINFORCE.
+Minimises L(θ) = -sum_i E(f(p(x_i; θ) ⊕ x_i), y_i*) via REINFORCE.
 
-  p(x; θ)  -- T5-small prefix model (trained)
-  f(·)     -- frozen Claude via Bedrock (inference-only)
-  E(·, ·)  -- exact-match evaluator on GSM8K final numeric answer
+  p*           -- hidden prefix drawn from prefix_pool at startup
+  y_i*         -- gold output f(p* ⊕ x_i), pre-computed once
+  p(x; θ)     -- T5-small prefix model (trained)
+  f(·)         -- frozen Claude via Bedrock (inference-only)
+  E(y, y*)     -- cosine similarity between sentence embeddings, scaled to [0, 100]
 """
 
 import argparse
 import concurrent.futures
+import json
 import os
 import random
 import time
@@ -17,9 +20,11 @@ import time
 import torch
 from tqdm import tqdm
 
-from dataset import load_gsm8k, extract_gold_answer, extract_predicted_answer, score
 from frozen_llm import FrozenLLM
+from instructions import INSTRUCTIONS
+from judge import score_batch
 from prefix_model import PrefixModel
+from prefix_pool import get_prefix, PREFIX_POOL
 
 
 def call_llm(llm: FrozenLLM, prompt: str) -> str:
@@ -29,24 +34,75 @@ def call_llm(llm: FrozenLLM, prompt: str) -> str:
         return ""
 
 
-def evaluate(prefix_model: PrefixModel, llm: FrozenLLM, examples: list) -> float:
-    """Return mean accuracy on examples using greedy prefix decoding."""
-    correct = 0
-    for ex in tqdm(examples, desc="eval", leave=False):
-        gold = extract_gold_answer(ex["answer"])
-        if gold is None:
-            continue
-        prefix_text, _ = prefix_model.generate(ex["question"])
-        prompt = f"{prefix_text}\n\n{ex['question']}" if prefix_text else ex["question"]
-        correct += score(gold, extract_predicted_answer(llm(prompt)))
-    return correct / len(examples) if examples else 0.0
+def build_prompt(prefix: str, instruction: str) -> str:
+    return f"{prefix}\n\n{instruction}" if prefix else instruction
+
+
+def precompute_gold(
+    llm: FrozenLLM,
+    p_star: str,
+    instructions: list[str],
+    cache_path: str | None,
+) -> dict[str, str]:
+    """Return {instruction: gold_output} for every instruction in the pool.
+
+    If cache_path is given and the file exists, load from disk. Otherwise
+    compute via the frozen LLM and optionally save to cache_path.
+    """
+    if cache_path and os.path.exists(cache_path):
+        print(f"Loading gold outputs from cache: {cache_path}")
+        with open(cache_path) as f:
+            return json.load(f)
+
+    print(f"Pre-computing {len(instructions)} gold outputs (p* = '{p_star[:60]}…')")
+    prompts = [build_prompt(p_star, x) for x in instructions]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(prompts))) as pool:
+        outputs = list(tqdm(pool.map(lambda pr: call_llm(llm, pr), prompts), total=len(prompts), desc="gold"))
+
+    gold = {x: y for x, y in zip(instructions, outputs)}
+
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(gold, f, indent=2)
+        print(f"Gold outputs cached to: {cache_path}")
+
+    return gold
+
+
+def evaluate(
+    prefix_model: PrefixModel,
+    llm: FrozenLLM,
+    gold: dict[str, str],
+    eval_instructions: list[str],
+) -> float:
+    """Return mean judge score on eval_instructions using greedy prefix decoding."""
+    scores = []
+    for x in tqdm(eval_instructions, desc="eval", leave=False):
+        prefix_text, _ = prefix_model.generate(x, temperature=1.0)
+        prompt = build_prompt(prefix_text, x)
+        y_hat = call_llm(llm, prompt)
+        y_star = gold[x]
+        from judge import score_pair
+        scores.append(score_pair(y_hat, y_star))
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def train(args):
-    print("Loading GSM8K …")
-    train_data = list(load_gsm8k("train"))
-    test_data = list(load_gsm8k("test"))
-    eval_examples = random.sample(test_data, min(args.eval_size, len(test_data)))
+    print(f"Hidden prefix (p*): '{get_prefix(args.prefix_id)[:80]}…'")
+    p_star = get_prefix(args.prefix_id)
+
+    instructions = INSTRUCTIONS
+    eval_instructions = random.sample(instructions, min(args.eval_size, len(instructions)))
+
+    print(f"Initialising frozen LLM ({args.llm_model}) …")
+    llm = FrozenLLM(model=args.llm_model)
+
+    cache_path = (
+        os.path.join(args.cache_dir, f"gold_prefix{args.prefix_id}.json")
+        if args.cache_dir else None
+    )
+    gold = precompute_gold(llm, p_star, instructions, cache_path)
 
     print(f"Initialising prefix model ({args.prefix_model}) …")
     prefix_model = PrefixModel(
@@ -56,60 +112,38 @@ def train(args):
     )
     print(f"  device: {prefix_model.device}")
 
-    print(f"Initialising frozen LLM ({args.llm_model}) …")
-    llm = FrozenLLM(model=args.llm_model)
-
     # ------------------------------------------------------------------ warm-start
     if args.warmup_steps > 0:
-        print(f"Warm-starting for {args.warmup_steps} steps on gold answers …")
-        warmup_pool = [ex for ex in random.sample(train_data, 256)
-                       if extract_gold_answer(ex["answer"]) is not None]
-        warmup_qs = [ex["question"] for ex in warmup_pool]
-        warmup_targets = [str(extract_gold_answer(ex["answer"])) for ex in warmup_pool]
+        print(f"Warm-starting for {args.warmup_steps} steps …")
+        warmup_pool = random.sample(instructions, min(64, len(instructions)))
         prefix_model.warm_start(
-            questions=warmup_qs,
-            targets=warmup_targets,
+            questions=warmup_pool,
+            targets=["you are a ..."] * len(warmup_pool),
             num_steps=args.warmup_steps,
             lr=args.warmup_lr,
         )
 
     # ------------------------------------------------------------------ REINFORCE
     optimizer = torch.optim.Adam(prefix_model.parameters(), lr=args.lr)
-    baseline = 0.0  # EMA of recent mean rewards
+    baseline = 50.0  # midpoint of [0, 100] score range
 
     os.makedirs(args.save_dir, exist_ok=True)
-    best_acc = 0.0
+    best_score = 0.0
 
     for step in range(args.num_steps):
         t0 = time.perf_counter()
-        raw_batch = random.sample(train_data, args.batch_size)
-
-        questions = []
-        golds = []
-        for ex in raw_batch:
-            gold = extract_gold_answer(ex["answer"])
-            if gold is not None:
-                questions.append(ex["question"])
-                golds.append(gold)
-
-        if not questions:
-            continue
+        batch_instructions = random.sample(instructions, args.batch_size)
 
         prefix_texts, log_probs = prefix_model.generate_batch(
-            questions, temperature=args.temperature
+            batch_instructions, temperature=args.temperature
         )
 
-        prompts = [
-            f"{p}\n\n{q}" if p else q
-            for p, q in zip(prefix_texts, questions)
-        ]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as pool:
-            llm_outputs = list(pool.map(lambda pr: call_llm(llm, pr), prompts))
+        pred_prompts = [build_prompt(p, x) for p, x in zip(prefix_texts, batch_instructions)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(pred_prompts)) as pool:
+            y_hats = list(pool.map(lambda pr: call_llm(llm, pr), pred_prompts))
 
-        rewards = [
-            score(gold, extract_predicted_answer(out))
-            for gold, out in zip(golds, llm_outputs)
-        ]
+        y_stars = [gold[x] for x in batch_instructions]
+        rewards = score_batch(y_hats, y_stars)
 
         mean_reward = sum(rewards) / len(rewards)
         baseline = 0.9 * baseline + 0.1 * mean_reward
@@ -128,46 +162,64 @@ def train(args):
 
         elapsed = time.perf_counter() - t0
         print(
-            f"step {step:4d}  reward={mean_reward:.3f}  "
-            f"baseline={baseline:.3f}  loss={loss.item():.4f}  "
+            f"step {step:4d}  reward={mean_reward:.1f}  "
+            f"baseline={baseline:.1f}  loss={loss.item():.4f}  "
             f"step_time={elapsed:.1f}s  "
             f"prefix='{prefix_texts[0][:60]}'"
         )
 
         # -------------------------------------------------------------- eval
         if (step + 1) % args.eval_every == 0:
-            acc = evaluate(prefix_model, llm, eval_examples)
-            print(f"  → eval accuracy: {acc:.3f}")
-            if acc > best_acc:
-                best_acc = acc
+            score = evaluate(prefix_model, llm, gold, eval_instructions)
+            print(f"  → eval mean judge score: {score:.1f}/100")
+            if score > best_score:
+                best_score = score
                 prefix_model.save(os.path.join(args.save_dir, "best"))
-                print(f"  → saved best checkpoint (acc={best_acc:.3f})")
+                print(f"  → saved best checkpoint (score={best_score:.1f})")
 
-    print(f"\nTraining complete. Best eval accuracy: {best_acc:.3f}")
+    print(f"\nTraining complete. Best eval score: {best_score:.1f}/100")
     prefix_model.save(os.path.join(args.save_dir, "final"))
 
 
 def main():
-    p = argparse.ArgumentParser(description="Train the Auto-Simas prefix model on GSM8K.")
-    p.add_argument("--num-steps", type=int, default=100)
+    p = argparse.ArgumentParser(
+        description="Train the T5 prefix model to recover a hidden prefix p*."
+    )
+    p.add_argument(
+        "--prefix-id", type=int, default=0,
+        help=f"Index of p* in the prefix pool (0-{len(PREFIX_POOL)-1}).",
+    )
+    p.add_argument("--num-steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--temperature", type=float, default=1.0,
-                   help="Sampling temperature for prefix generation during training.")
+    p.add_argument(
+        "--temperature", type=float, default=1.0,
+        help="Sampling temperature for prefix generation during training.",
+    )
     p.add_argument("--max-prefix-tokens", type=int, default=32)
-    p.add_argument("--warmup-steps", type=int, default=20,
-                   help="Number of supervised warm-start steps before REINFORCE.")
+    p.add_argument(
+        "--warmup-steps", type=int, default=3,
+        help="Supervised warm-start steps that train T5 to directly output p*.",
+    )
     p.add_argument("--warmup-lr", type=float, default=1e-3)
-    p.add_argument("--eval-every", type=int, default=10)
-    p.add_argument("--eval-size", type=int, default=50)
-    p.add_argument("--save-dir", type=str, default="checkpoints")
+    p.add_argument("--eval-every", type=int, default=20)
+    p.add_argument("--eval-size", type=int, default=20)
+    p.add_argument("--save-dir", type=str, default="checkpoints2")
     p.add_argument("--prefix-model", type=str, default="t5-small")
     p.add_argument("--llm-model", type=str, default="us.anthropic.claude-haiku-4-5-20251001-v1:0")
-    p.add_argument("--device", type=str, default=None,
-                   help="Device for the prefix model (cpu, mps, cuda). Defaults to auto-detect.")
+    p.add_argument(
+        "--device", type=str, default=None,
+        help="Device for the prefix model (cpu, mps, cuda). Defaults to auto-detect.",
+    )
+    p.add_argument(
+        "--cache-dir", type=str, default="gold_cache",
+        help="Directory to cache pre-computed gold outputs. Set to empty string to disable.",
+    )
     p.add_argument("--seed", type=int, default=42)
 
     args = p.parse_args()
+    if args.cache_dir == "":
+        args.cache_dir = None
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
