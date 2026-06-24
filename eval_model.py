@@ -7,8 +7,7 @@ Usage:
 
 import argparse
 import random
-
-from tqdm import tqdm
+import textwrap
 
 from dataset import load_gsm8k, extract_gold_answer, extract_predicted_answer, score
 from frozen_llm import FrozenLLM
@@ -38,7 +37,8 @@ def main():
     llm = FrozenLLM(model=args.llm_model)
 
     correct = 0
-    for ex in tqdm(data, desc="model eval"):
+    sep = "-" * 72
+    for i, ex in enumerate(data):
         gold = extract_gold_answer(ex["answer"])
         if gold is None:
             continue
@@ -46,8 +46,16 @@ def main():
         prefix_text, _ = prefix_model.generate(ex["question"], temperature=1.0)
         prompt = f"{prefix_text}\n\n{ex['question']}" if prefix_text else ex["question"]
         output = llm(prompt)
-        correct += score(gold, extract_predicted_answer(output))
+        hit = score(gold, extract_predicted_answer(output))
+        correct += hit
 
+        print(sep)
+        print(f"[{i+1}] {'CORRECT' if hit else 'WRONG'}  gold={gold}")
+        print(f"  Q : {textwrap.shorten(ex['question'], 120)}")
+        print(f"  P : {prefix_text!r}")
+        print(f"  A : {textwrap.shorten(output.strip(), 120)}")
+
+    print(sep)
     acc = correct / len(data)
     print(f"\nAuto-Simas ({args.checkpoint}, n={len(data)}): accuracy = {acc:.3f} ({correct}/{len(data)})")
 
