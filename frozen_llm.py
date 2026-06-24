@@ -1,4 +1,5 @@
 import boto3
+from botocore.config import Config
 
 
 class FrozenLLM:
@@ -10,9 +11,13 @@ class FrozenLLM:
         region: str = "us-east-1",
         profile: str = "ai-privileged",
         max_tokens: int = 512,
+        read_timeout: int = 30,
     ):
         session = boto3.Session(profile_name=profile, region_name=region)
-        self.client = session.client("bedrock-runtime")
+        self.client = session.client(
+            "bedrock-runtime",
+            config=Config(read_timeout=read_timeout, connect_timeout=10),
+        )
         self.model = model
         self.max_tokens = max_tokens
 
