@@ -1,13 +1,19 @@
 """
-Hidden-prefix recovery training loop.
+Hidden-prefix recovery via LM-judge supervision.
 
-Minimises L(θ) = -sum_i E(f(p(x_i; θ) ⊕ x_i), y_i*) via REINFORCE.
+For each training step:
+  1. Decode the current prefix p_i = p(x_i; θ) from T5 (greedy).
+  2. Generate ŷ_i = f(p_i ⊕ x_i) using the frozen LLM f.
+  3. Query the same LLM class E with (x_i, ŷ_i, y_i*) to infer a candidate
+     prefix p_est_i.
+  4. Minimise cross-entropy between T5's output distribution and p_est_i
+     (teacher-forcing).
 
   p*           -- hidden prefix drawn from prefix_pool at startup
-  y_i*         -- gold output f(p* ⊕ x_i), pre-computed once
-  p(x; θ)     -- T5-small prefix model (trained)
+  y_i*         -- gold output f(p* ⊕ x_i), pre-computed once and cached
+  p(x; θ)     -- T5-small seq2seq prefix model (trained)
   f(·)         -- frozen Claude via Bedrock (inference-only)
-  E(y, y*)     -- cosine similarity between sentence embeddings, scaled to [0, 100]
+  E(x, ŷ, y*) -- same LLM class as f, prompted to infer the prefix
 """
 
 import argparse
@@ -22,7 +28,7 @@ from tqdm import tqdm
 
 from frozen_llm import FrozenLLM
 from instructions import INSTRUCTIONS
-from judge import score_batch
+from judge import score_pair
 from prefix_model import PrefixModel
 from prefix_pool import get_prefix, PREFIX_POOL
 
@@ -36,6 +42,25 @@ def call_llm(llm: FrozenLLM, prompt: str) -> str:
 
 def build_prompt(prefix: str, instruction: str) -> str:
     return f"{prefix}\n\n{instruction}" if prefix else instruction
+
+
+def infer_prefix(llm: FrozenLLM, x: str, y_hat: str, y_star: str) -> str:
+    """Ask E to infer the hidden prefix from one (x, ŷ, y*) triple."""
+    prompt = (
+        "You are given an instruction and two responses to it. "
+        "Response A was produced by a language model conditioned on a hidden system prompt. "
+        "Response B was produced by the same model conditioned on a different prefix.\n\n"
+        f"Instruction:\n{x}\n\n"
+        f"Response A (from the hidden system prompt):\n{y_star}\n\n"
+        f"Response B (from a different prefix):\n{y_hat}\n\n"
+        "Based on the style, tone, and approach of Response A, infer the hidden system prompt. "
+        "Output only the system prompt text, with no explanation or preamble. "
+        "Keep it concise (1–3 sentences)."
+    )
+    try:
+        return llm(prompt)
+    except Exception:
+        return ""
 
 
 def precompute_gold(
@@ -80,11 +105,8 @@ def evaluate(
     scores = []
     for x in tqdm(eval_instructions, desc="eval", leave=False):
         prefix_text, _ = prefix_model.generate(x, temperature=1.0)
-        prompt = build_prompt(prefix_text, x)
-        y_hat = call_llm(llm, prompt)
-        y_star = gold[x]
-        from judge import score_pair
-        scores.append(score_pair(y_hat, y_star))
+        y_hat = call_llm(llm, build_prompt(prefix_text, x))
+        scores.append(score_pair(y_hat, gold[x]))
     return sum(scores) / len(scores) if scores else 0.0
 
 
@@ -123,10 +145,8 @@ def train(args):
             lr=args.warmup_lr,
         )
 
-    # ------------------------------------------------------------------ REINFORCE
+    # ------------------------------------------------------------------ main loop
     optimizer = torch.optim.Adam(prefix_model.parameters(), lr=args.lr)
-    baseline = 50.0  # midpoint of [0, 100] score range
-
     os.makedirs(args.save_dir, exist_ok=True)
     best_score = 0.0
 
@@ -134,38 +154,63 @@ def train(args):
         t0 = time.perf_counter()
         batch_instructions = random.sample(instructions, args.batch_size)
 
-        prefix_texts, log_probs = prefix_model.generate_batch(
-            batch_instructions, temperature=args.temperature
-        )
+        # Step 1: greedy-decode the current prefix for each instruction.
+        prefix_model.model.eval()
+        with torch.no_grad():
+            enc = prefix_model._encode(batch_instructions)
+            out_ids = prefix_model.model.generate(
+                input_ids=enc.input_ids,
+                attention_mask=enc.attention_mask,
+                max_new_tokens=args.max_prefix_tokens,
+                do_sample=False,
+            )
+        prefix_texts = prefix_model.tokenizer.batch_decode(out_ids[:, 1:], skip_special_tokens=True)
 
+        # Step 2: generate ŷ_i = f(p_i ⊕ x_i) for each example.
         pred_prompts = [build_prompt(p, x) for p, x in zip(prefix_texts, batch_instructions)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(pred_prompts)) as pool:
             y_hats = list(pool.map(lambda pr: call_llm(llm, pr), pred_prompts))
 
+        # Step 3: query E(x_i, ŷ_i, y_i*) to infer p_est_i for each example.
         y_stars = [gold[x] for x in batch_instructions]
-        rewards = score_batch(y_hats, y_stars)
+        triples = list(zip(batch_instructions, y_hats, y_stars))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(triples)) as pool:
+            p_ests = list(pool.map(lambda t: infer_prefix(llm, *t), triples))
 
-        mean_reward = sum(rewards) / len(rewards)
-        baseline = 0.9 * baseline + 0.1 * mean_reward
-
-        advantages = torch.tensor(
-            [r - baseline for r in rewards],
-            dtype=torch.float32,
-            device=prefix_model.device,
-        )
-        loss = -(advantages * log_probs).mean()
-
+        # Step 4: teacher-forcing cross-entropy toward p_est_i.
+        prefix_model.model.train()
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(prefix_model.parameters(), max_norm=1.0)
-        optimizer.step()
+        total_loss = 0.0
+        n_valid = 0
+        for x, p_est in zip(batch_instructions, p_ests):
+            if not p_est.strip():
+                continue
+            enc_x = prefix_model._encode([x])
+            target_ids = prefix_model.tokenizer(
+                p_est,
+                return_tensors="pt",
+                max_length=args.max_prefix_tokens,
+                truncation=True,
+            ).input_ids.to(prefix_model.device)
+            out = prefix_model.model(
+                input_ids=enc_x.input_ids,
+                attention_mask=enc_x.attention_mask,
+                labels=target_ids,
+            )
+            out.loss.backward()
+            total_loss += out.loss.item()
+            n_valid += 1
+
+        if n_valid > 0:
+            torch.nn.utils.clip_grad_norm_(prefix_model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         elapsed = time.perf_counter() - t0
         print(
-            f"step {step:4d}  reward={mean_reward:.1f}  "
-            f"baseline={baseline:.1f}  loss={loss.item():.4f}  "
-            f"step_time={elapsed:.1f}s  "
-            f"prefix='{prefix_texts[0][:60]}'"
+            f"step {step:4d}  loss={total_loss / max(n_valid, 1):.4f}  "
+            f"valid={n_valid}/{args.batch_size}  step_time={elapsed:.1f}s\n"
+            f"  p=    '{prefix_texts[0][:80]}'\n"
+            f"  p_est='{p_ests[0][:80]}'"
         )
 
         # -------------------------------------------------------------- eval
@@ -183,7 +228,7 @@ def train(args):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Train the T5 prefix model to recover a hidden prefix p*."
+        description="Train the T5 prefix model to recover a hidden prefix p* via LM-judge supervision."
     )
     p.add_argument(
         "--prefix-id", type=int, default=0,
@@ -192,19 +237,15 @@ def main():
     p.add_argument("--num-steps", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument(
-        "--temperature", type=float, default=1.0,
-        help="Sampling temperature for prefix generation during training.",
-    )
-    p.add_argument("--max-prefix-tokens", type=int, default=32)
+    p.add_argument("--max-prefix-tokens", type=int, default=64)
     p.add_argument(
         "--warmup-steps", type=int, default=3,
-        help="Supervised warm-start steps that train T5 to directly output p*.",
+        help="Supervised steps that warm-start T5 to output 'you are a ...' before the main loop.",
     )
     p.add_argument("--warmup-lr", type=float, default=1e-3)
     p.add_argument("--eval-every", type=int, default=20)
     p.add_argument("--eval-size", type=int, default=20)
-    p.add_argument("--save-dir", type=str, default="checkpoints2")
+    p.add_argument("--save-dir", type=str, default="checkpoints_lm_judge")
     p.add_argument("--prefix-model", type=str, default="t5-small")
     p.add_argument("--llm-model", type=str, default="us.anthropic.claude-haiku-4-5-20251001-v1:0")
     p.add_argument(
@@ -213,7 +254,7 @@ def main():
     )
     p.add_argument(
         "--cache-dir", type=str, default="gold_cache",
-        help="Directory to cache pre-computed gold outputs. Set to empty string to disable.",
+        help="Directory for cached gold outputs. Set to empty string to disable.",
     )
     p.add_argument("--seed", type=int, default=42)
 
